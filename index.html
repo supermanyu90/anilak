@@ -350,13 +350,15 @@
 <div id="settings" class="fixed inset-0 z-50 hidden items-center justify-center bg-ink/30 p-4" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
   <div class="glass w-full max-w-md rounded-3xl bg-white p-6 shadow-lift">
     <h3 id="settingsTitle" class="font-display text-2xl font-semibold text-ink">Developer settings</h3>
-    <p class="mt-1 text-xs text-ink2">Add a Gemini API key to answer with Gemini. Without one, Vayu uses the built-in offline rules engine. The key stays in this browser's local storage and is only sent to generativelanguage.googleapis.com.</p>
+    <p class="mt-1 text-xs text-ink2">Add a Gemini API key to answer with Gemini. Without one, Vayu uses the built-in offline rules engine. Add a Sarvam API key to transcribe voice with Sarvam instead of the browser. Keys stay in this browser's local storage and are only sent to generativelanguage.googleapis.com and api.sarvam.ai.</p>
     <label class="mt-4 block text-xs text-ink2" for="apiKey">Gemini API key</label>
     <input id="apiKey" type="password" autocomplete="off" class="mt-1 w-full rounded-lg border border-ink/10 bg-cream px-3 py-2 text-sm text-ink outline-none focus:border-sage-ink" placeholder="AIza…" />
     <label class="mt-3 block text-xs text-ink2" for="model">Model</label>
     <input id="model" class="mt-1 w-full rounded-lg border border-ink/10 bg-cream px-3 py-2 text-sm text-ink outline-none focus:border-sage-ink" />
+    <label class="mt-3 block text-xs text-ink2" for="sarvamKey">Sarvam API key (voice input)</label>
+    <input id="sarvamKey" type="password" autocomplete="off" class="mt-1 w-full rounded-lg border border-ink/10 bg-cream px-3 py-2 text-sm text-ink outline-none focus:border-sage-ink" />
     <div class="mt-5 flex justify-end gap-2">
-      <button id="clearKey" class="rounded-lg px-3 py-2 text-sm text-ink2 hover:bg-blush-50">Clear key</button>
+      <button id="clearKey" class="rounded-lg px-3 py-2 text-sm text-ink2 hover:bg-blush-50">Clear keys</button>
       <button id="closeSettings" class="rounded-lg px-3 py-2 text-sm hover:bg-blush-50">Cancel</button>
       <button id="saveSettings" class="rounded-xl bg-gold px-4 py-2 text-sm font-semibold text-ink hover:brightness-105">Save</button>
     </div>
@@ -835,7 +837,7 @@ $('sim').addEventListener('input', (e) => {
    ========================================================================= */
 const Speech = (() => {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let rec = null, listening = false, finalText = '', rate = +store.get('hb_rate', '1');
+  let rec = null, mediaRec = null, capTimer = null, listening = false, finalText = '', rate = +store.get('hb_rate', '1');
   let voices = [];
   const loadVoices = () => { voices = window.speechSynthesis ? speechSynthesis.getVoices() : []; };
   if (window.speechSynthesis) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
@@ -846,7 +848,52 @@ const Speech = (() => {
     return voices.find((v) => norm(v.lang) === want) || voices.find((v) => norm(v.lang).startsWith(base + '-')) || null;
   }
 
+  // Sarvam path: record a clip, then transcribe it with saaras:v4 (REST endpoint is for clips under 30 s).
+  async function startSarvam(key, onInterim, onFinal) {
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch { note('Microphone permission was denied.'); return false; }
+    const mime = ['audio/webm', 'audio/mp4', 'audio/ogg'].find((t) => MediaRecorder.isTypeSupported(t));
+    const chunks = [];
+    mediaRec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    mediaRec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    mediaRec.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      clearTimeout(capTimer); mediaRec = null; listening = false; micUI(false);
+      const blob = new Blob(chunks, { type: (chunks[0]?.type || mime || 'audio/webm').split(';')[0] });
+      if (blob.size < 2000) { note('I didn\'t hear anything. Try again.'); Mascot.setMascotState('IDLE'); return; }
+      Mascot.setMascotState('THINKING'); onInterim('Transcribing…');
+      try {
+        const { text, language } = await sarvamTranscribe(blob, key);
+        onInterim(text);
+        if (text) onFinal(text, language); else { note('Sarvam returned no speech. Try again.'); Mascot.setMascotState('IDLE'); }
+      } catch (e) { onInterim(''); note('Sarvam: ' + e.message); Mascot.setMascotState('IDLE'); }
+    };
+    mediaRec.start();
+    listening = true; Mascot.setMascotState('LISTENING'); micUI(true);
+    capTimer = setTimeout(() => { if (mediaRec?.state === 'recording') mediaRec.stop(); }, 25000);
+    return true;
+  }
+
+  async function sarvamTranscribe(blob, key) {
+    const ext = { 'audio/webm': 'webm', 'audio/mp4': 'm4a', 'audio/ogg': 'ogg' }[blob.type] || 'webm';
+    const fd = new FormData();
+    fd.append('file', blob, 'speech.' + ext);
+    fd.append('model', 'saaras:v4');
+    fd.append('language_code', 'unknown'); // let Sarvam detect the spoken language
+    const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 20000);
+    try {
+      const r = await fetch('https://api.sarvam.ai/speech-to-text', { method: 'POST', headers: { 'api-subscription-key': key }, body: fd, signal: ctrl.signal });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error?.message || 'HTTP ' + r.status);
+      return { text: (j.transcript || '').trim(), language: j.language_code || null };
+    } catch (e) { throw e.name === 'AbortError' ? new Error('timed out') : e; }
+    finally { clearTimeout(to); }
+  }
+
   function start(lang, onInterim, onFinal) {
+    const sarvamKey = store.get('hb_sarvam_key', '');
+    if (sarvamKey && window.MediaRecorder && navigator.mediaDevices) { stopSpeaking(); return startSarvam(sarvamKey, onInterim, onFinal); }
     if (!SR) { note('Speech recognition is not supported in this browser. Try Chrome or Edge, or type your question.'); return false; }
     stopSpeaking();
     rec = new SR();
@@ -874,7 +921,7 @@ const Speech = (() => {
     try { rec.start(); } catch { return false; }
     return true;
   }
-  function stopListening() { if (rec && listening) rec.stop(); }
+  function stopListening() { if (mediaRec?.state === 'recording') mediaRec.stop(); else if (rec && listening) rec.stop(); }
 
   // Chrome cuts long utterances; speak sentence by sentence.
   function speakText(text, lang, r = rate) {
@@ -1070,10 +1117,11 @@ Vulnerable groups: children, older adults, pregnant people, people with asthma/C
   } finally { clearTimeout(to); }
 }
 
-async function processQuery(query) {
+// langHint: language detected from speech (Sarvam); used when it is one we answer in.
+async function processQuery(query, langHint) {
   query = query.trim();
   if (!query) return;
-  const langTag = detectLanguage(query, $('lang').value);
+  const langTag = detectLanguage(query, L10N[(langHint || '').split('-')[0]] ? langHint : $('lang').value);
   const lang = langTag.split('-')[0];
   const T = L10N[lang] || L10N.en;
   hasAsked = true;
@@ -1182,24 +1230,26 @@ function renderRates() {
 document.querySelectorAll('#rates button').forEach((b) => b.addEventListener('click', () => { Speech.setRate(+b.dataset.rate); renderRates(); }));
 renderRates();
 
-if (!Speech.supported) note('Voice input needs Chrome or Edge. You can still type questions.');
+if (!Speech.supported && !store.get('hb_sarvam_key', '')) note('Voice input needs Chrome or Edge. You can still type questions.');
 if (!window.speechSynthesis) $('autoSpeak').disabled = true;
 
 // Settings modal
 function updateEngineBadge() {
   const on = !!store.get('hb_key', '');
-  $('engineBadge').textContent = on ? 'Gemini · ' + store.get('hb_model', 'gemini-3-flash-preview') : 'Offline rules engine';
+  $('engineBadge').textContent = (on ? 'Gemini · ' + store.get('hb_model', 'gemini-3-flash-preview') : 'Offline rules engine') + (store.get('hb_sarvam_key', '') ? ' · Sarvam voice' : '');
 }
 const modal = $('settings');
-const openModal = () => { $('apiKey').value = store.get('hb_key', ''); $('model').value = store.get('hb_model', 'gemini-3-flash-preview'); modal.classList.remove('hidden'); modal.classList.add('flex'); $('apiKey').focus(); };
+const openModal = () => { $('apiKey').value = store.get('hb_key', ''); $('model').value = store.get('hb_model', 'gemini-3-flash-preview'); $('sarvamKey').value = store.get('hb_sarvam_key', ''); modal.classList.remove('hidden'); modal.classList.add('flex'); $('apiKey').focus(); };
 const closeModal = () => { modal.classList.add('hidden'); modal.classList.remove('flex'); $('openSettings').focus(); };
 $('openSettings').addEventListener('click', openModal);
 $('closeSettings').addEventListener('click', closeModal);
 $('saveSettings').addEventListener('click', () => {
   const k = $('apiKey').value.trim(), m = $('model').value.trim() || 'gemini-3-flash-preview';
-  k ? store.set('hb_key', k) : store.del('hb_key'); store.set('hb_model', m); updateEngineBadge(); closeModal();
+  k ? store.set('hb_key', k) : store.del('hb_key'); store.set('hb_model', m);
+  const s = $('sarvamKey').value.trim(); s ? store.set('hb_sarvam_key', s) : store.del('hb_sarvam_key');
+  updateEngineBadge(); closeModal();
 });
-$('clearKey').addEventListener('click', () => { $('apiKey').value = ''; store.del('hb_key'); updateEngineBadge(); });
+$('clearKey').addEventListener('click', () => { $('apiKey').value = ''; $('sarvamKey').value = ''; store.del('hb_key'); store.del('hb_sarvam_key'); updateEngineBadge(); });
 modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal(); });
 updateEngineBadge();
