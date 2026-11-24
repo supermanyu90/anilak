@@ -13,7 +13,7 @@ const AUDIO_EXT = { 'audio/webm': 'webm', 'audio/mp4': 'm4a', 'audio/ogg': 'ogg'
 
 // Best-effort limiter: per warm function instance, resets on cold start.
 const seen = new Map();
-function rateLimited(ip, now = Date.now()) {
+export function rateLimited(ip, now = Date.now()) {
   const recent = (seen.get(ip) || []).filter((t) => now - t < WINDOW_MS);
   recent.push(now);
   seen.set(ip, recent);
@@ -53,7 +53,7 @@ function send(res, status, body) {
 }
 const fail = (res, status, message) => send(res, status, { error: { message } });
 
-async function handler(req, res) {
+export default async function handler(req, res) {
   const key = process.env.SARVAM_API_KEY;
   const op = new URL(req.url, 'http://local').searchParams.get('op');
 
@@ -100,5 +100,3 @@ async function handler(req, res) {
   }
 }
 
-module.exports = handler;
-module.exports.rateLimited = rateLimited; // exported for tests

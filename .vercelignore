@@ -1,2 +1,7 @@
 .env
 CLAUDE.md
+README.md
+node_modules
+tests
+eslint.config.js
+.github
