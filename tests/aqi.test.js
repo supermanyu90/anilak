@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { aqiToPm25, pm25ToAqi, bandIndex, indianAQI, cpcbCat, cleanestWindow } from '../js/lib/aqi.js';
+import { aqiToPm25, pm25ToAqi, bandIndex, indianAQI, cpcbCat, cleanestWindow, activeGrapStage } from '../js/lib/aqi.js';
 
 test('US AQI <-> PM2.5 matches EPA breakpoints', () => {
   assert.equal(aqiToPm25(50), 9);
@@ -44,4 +44,12 @@ test('cleanestWindow picks the lowest 2-hour daytime pair and ignores night hour
   assert.equal(w.h, 14);
   assert.equal(w.avg, 95);
   assert.equal(cleanestWindow([day(1, 5), day(2, 5)]), null, 'no daytime window');
+});
+
+test('activeGrapStage picks the highest stage reached, or -1', () => {
+  assert.equal(activeGrapStage(150), -1);
+  assert.equal(activeGrapStage(201), 0);
+  assert.equal(activeGrapStage(399), 1);
+  assert.equal(activeGrapStage(420), 2);
+  assert.equal(activeGrapStage(500), 3);
 });

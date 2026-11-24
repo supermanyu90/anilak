@@ -6,3 +6,8 @@ tests
 eslint.config.js
 .github
 docs
+jsconfig.json
+tsconfig.strict.json
+.prettierrc.json
+.prettierignore
+js/globals.d.ts

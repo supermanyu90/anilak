@@ -2,23 +2,34 @@
 import { loadCity, onAirChange, renderAir, useMyLocation } from './air.js';
 import { CITIES } from './data/cities.js';
 import { $, note } from './dom.js';
-import { sarvamAvailable } from './sarvam.js';
+import { logger } from './lib/log.js';
+import { sarvamAvailable } from './sarvam-access.js';
 import { Speech } from './speech.js';
-import { updateInsights } from './ui/hub.js';
+import { updateInsights } from './ui/hub/index.js';
 import './ui/controls.js';
 import './ui/settings.js';
+
+const log = logger('main');
 
 if (!Speech.supported && !sarvamAvailable()) note('Voice input needs Chrome or Edge. You can still type questions.');
 if (!window.speechSynthesis && !sarvamAvailable()) $('autoSpeak').disabled = true;
 
 onAirChange(updateInsights);
 
-// Initial data: try the user's location silently if already permitted, else Delhi.
-renderAir();
-(async () => {
+/** Use the visitor's location if they have already granted it; otherwise start with Delhi. */
+async function loadInitialAir() {
   try {
-    const p = await navigator.permissions?.query({ name: 'geolocation' });
-    if (p && p.state === 'granted') { useMyLocation(); return; }
-  } catch {}
-  $('city').value = '0'; loadCity(CITIES[0]);
-})();
+    const permission = await navigator.permissions?.query({ name: 'geolocation' });
+    if (permission?.state === 'granted') {
+      useMyLocation();
+      return;
+    }
+  } catch (e) {
+    log.debug('geolocation permission query unsupported', e); // older Safari; fall through to Delhi
+  }
+  $('city').value = '0';
+  loadCity(CITIES[0]);
+}
+
+renderAir();
+loadInitialAir();

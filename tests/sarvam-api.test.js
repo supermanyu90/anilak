@@ -6,7 +6,14 @@ import handler, { rateLimited } from '../api/sarvam.js';
 const realFetch = globalThis.fetch;
 let upstreamCalls;
 
-function call({ method = 'POST', op = 'tts', origin = 'https://anilak.vercel.app', body = '', type = 'application/json', ip }) {
+function call({
+  method = 'POST',
+  op = 'tts',
+  origin = 'https://anilak.vercel.app',
+  body = '',
+  type = 'application/json',
+  ip,
+}) {
   const req = Readable.from(body ? [Buffer.isBuffer(body) ? body : Buffer.from(body)] : []);
   Object.assign(req, {
     method,
@@ -22,8 +29,12 @@ function call({ method = 'POST', op = 'tts', origin = 'https://anilak.vercel.app
     const res = {
       statusCode: 200,
       headers: {},
-      setHeader(k, v) { this.headers[k] = v; },
-      end(data) { resolve({ status: this.statusCode, body: JSON.parse(data) }); },
+      setHeader(k, v) {
+        this.headers[k] = v;
+      },
+      end(data) {
+        resolve({ status: this.statusCode, body: JSON.parse(data) });
+      },
     };
     handler(req, res);
   });
@@ -34,11 +45,16 @@ beforeEach(() => {
   upstreamCalls = [];
   globalThis.fetch = async (url, init) => {
     upstreamCalls.push({ url, init });
-    const payload = url.endsWith('/text-to-speech') ? { audios: ['UklGRg=='] } : { transcript: 'hello', language_code: 'en-IN' };
+    const payload = url.endsWith('/text-to-speech')
+      ? { audios: ['UklGRg=='] }
+      : { transcript: 'hello', language_code: 'en-IN' };
     return new Response(JSON.stringify(payload), { status: 200 });
   };
 });
-afterEach(() => { globalThis.fetch = realFetch; delete process.env.SARVAM_API_KEY; });
+afterEach(() => {
+  globalThis.fetch = realFetch;
+  delete process.env.SARVAM_API_KEY;
+});
 
 test('status reports whether the key is configured', async () => {
   assert.deepEqual((await call({ method: 'GET', op: 'status' })).body, { enabled: true });
@@ -78,7 +94,8 @@ test('stt forwards audio with auto-detect and rejects empty or oversized uploads
 });
 
 test('upstream errors are passed through with their status', async () => {
-  globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: 'Quota exceeded' } }), { status: 429 });
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { message: 'Quota exceeded' } }), { status: 429 });
   const r = await call({ body: JSON.stringify({ text: 'hi', language_code: 'en-IN' }) });
   assert.equal(r.status, 429);
   assert.equal(r.body.error.message, 'Quota exceeded');
@@ -90,4 +107,27 @@ test('rate limiter allows 30 calls per IP per 10 minutes', () => {
   assert.equal(rateLimited('1.2.3.4', now), true, '31st call blocked');
   assert.equal(rateLimited('5.6.7.8', now), false, 'other IPs unaffected');
   assert.equal(rateLimited('1.2.3.4', now + 10 * 60 * 1000 + 1), false, 'window expires');
+});
+
+test('a stalled Sarvam call returns 504 instead of hanging', async () => {
+  process.env.SARVAM_TIMEOUT_MS = '30';
+  globalThis.fetch = (_url, init) =>
+    new Promise((_, reject) =>
+      init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))),
+    );
+  try {
+    const r = await call({ body: JSON.stringify({ text: 'hi', language_code: 'en-IN' }) });
+    assert.equal(r.status, 504);
+    assert.equal(r.body.error.message, 'Sarvam timed out');
+  } finally {
+    delete process.env.SARVAM_TIMEOUT_MS;
+  }
+});
+
+test('network failures to Sarvam return 502', async () => {
+  globalThis.fetch = async () => {
+    throw new TypeError('fetch failed');
+  };
+  const r = await call({ body: JSON.stringify({ text: 'hi', language_code: 'en-IN' }) });
+  assert.equal(r.status, 502);
 });

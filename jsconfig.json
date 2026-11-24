@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "checkJs": true,
+    "allowJs": true,
+    "noEmit": true,
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "strict": false,
+    "skipLibCheck": true,
+    "maxNodeModuleJsDepth": 0
+  },
+  "include": ["js/**/*.js", "js/**/*.d.ts", "api/**/*.js"],
+  "exclude": ["node_modules", "js/tailwind.config.js"]
+}

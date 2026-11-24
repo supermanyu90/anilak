@@ -6,7 +6,16 @@ const AIR = { aqi: 153, pm2_5: 75 };
 const intent = (q, lang = 'en-IN') => localEngine(q, lang, AIR).intent;
 
 test('safety guardrail catches acute symptoms, including curly apostrophes and Hindi', () => {
-  for (const q of ["I can't breathe", 'I can’t breathe', 'having trouble breathing', 'there is tightness in my chest', 'chest pain since an hour', 'साँस नहीं आ रही', 'বুকে ব্যথা', 'நெஞ்சு வலி']) {
+  for (const q of [
+    "I can't breathe",
+    'I can’t breathe',
+    'having trouble breathing',
+    'there is tightness in my chest',
+    'chest pain since an hour',
+    'साँस नहीं आ रही',
+    'বুকে ব্যথা',
+    'நெஞ்சு வலி',
+  ]) {
     assert.ok(isAcute(q), q);
   }
   assert.ok(!isAcute('I have a mild cough'));

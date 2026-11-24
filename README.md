@@ -60,26 +60,35 @@ Plain HTML, CSS and JavaScript ES modules, with no build step · Tailwind (Play 
 ## Project structure
 
 ```
-index.html              markup only
-css/styles.css          theme, paper grain, motion
+index.html                markup only
+css/styles.css            theme, paper grain, motion
 js/
-  main.js               entry point: wiring + first air reading
-  air.js                geolocation, Open-Meteo fetch, presets, simulator
-  assistant.js          question pipeline: guardrail -> Gemini/offline -> cards + speech
-  speech.js             speech in/out (Sarvam or Web Speech API)
-  sarvam.js             where the Sarvam key comes from (settings, local .env, /api proxy)
-  mascot.js             Three.js mascot
-  dom.js, icons.js      DOM/storage helpers, inline SVG icons
-  lib/                  pure logic, no DOM (unit-tested)
-    aqi.js              US EPA + India CPCB AQI maths, forecast windows
-    intent.js           keyword classifier, guardrail, language detection, exposure maths
-    gemini.js           optional Gemini call
-    util.js             small pure helpers
-  data/                 cities, localised advice templates, hub content
-  ui/                   controls, settings modal, Learn & act hub
-api/sarvam.js           Vercel function that keeps the Sarvam key server-side
-tests/                  node:test unit tests
-docs/screenshots/       images used in this README
+  main.js                 entry point: wiring + first air reading
+  config.js               shared constants: Sarvam/Gemini settings, storage keys, timeouts, limits
+  types.js, globals.d.ts  JSDoc types for the shared data shapes (type-checked, no runtime code)
+  air.js                  geolocation, presets, simulator; renders the current reading
+  assistant.js            question UI: runs the pipeline, renders reply, alert and cards
+  speech.js               recording and playback (Sarvam or Web Speech API)
+  sarvam-access.js        where Sarvam access comes from (settings, local .env, /api proxy)
+  mascot.js               Three.js mascot
+  dom.js, icons.js        DOM/storage helpers, inline SVG icons
+  lib/                    pure logic, no DOM, unit-tested
+    pipeline.js           guardrail -> Gemini -> offline fallback, reply language
+    intent.js             keyword classifier, guardrail, language detection, exposure maths
+    gemini.js             prompt, response validation, Gemini call
+    sarvam-client.js      speech-to-text / text-to-speech requests (direct or via proxy)
+    openmeteo.js          Open-Meteo URL and response parsing
+    aqi.js                US EPA + India CPCB AQI maths, GRAP stage, forecast window
+    http.js, log.js       fetch with timeout/retry + readable errors; structured logger
+    util.js               small pure helpers
+  data/                   cities, localised advice templates, hub content
+  ui/
+    controls.js           chips, language picker, mic/ask/stop/replay, voice speed
+    settings.js           settings modal and engine badge
+    hub/                  Learn & act: index (tabs, tiles), forecast, health, home, rules, myths
+api/sarvam.js             Vercel function that keeps the Sarvam key server-side
+tests/                    node:test unit tests
+docs/screenshots/         images used in this README
 ```
 
 ## Run locally
@@ -110,12 +119,18 @@ On `localhost` the page reads `SARVAM_API_KEY` from `.env` directly. On Vercel t
 ## Quality checks
 
 ```bash
-npm run lint       # ESLint (flat config)
-npm test           # node:test: AQI maths, intent engine, guardrail, API proxy
-npm run check      # both
+npm run lint           # ESLint (flat config)
+npm run typecheck      # TypeScript over JSDoc: whole app, plus strict mode for js/lib, js/config, api
+npm run format:check   # Prettier
+npm test               # 54 node:test tests: AQI maths, intent engine, guardrail, pipeline, Gemini parsing,
+                       # Open-Meteo parsing, Sarvam client, fetch timeouts/retries, API proxy
+npm run test:coverage  # same, with a coverage report
+npm run check          # lint + typecheck + format check + tests
 ```
 
-CI runs both on every push and pull request (`.github/workflows/ci.yml`).
+CI runs lint, typecheck, format check and tests with coverage on every push and pull request (`.github/workflows/ci.yml`).
+
+External calls have timeouts (Open-Meteo 9 s with one retry, Gemini 15 s, Sarvam 20 s). The proxy returns 504 on a Sarvam timeout and writes one JSON log line per failure. Set `ANILAK_DEBUG = true` in the browser console for verbose logs (on by default on localhost).
 
 ## Deploy
 

@@ -1,0 +1,5 @@
+{
+  "extends": "./jsconfig.json",
+  "compilerOptions": { "strict": true },
+  "include": ["js/config.js", "js/types.js", "js/lib/**/*.js", "js/data/**/*.js", "js/globals.d.ts", "api/**/*.js"]
+}

@@ -1,25 +1,63 @@
-/** Developer settings modal (Gemini + Sarvam keys) and the engine badge. */
+/** Developer settings modal (Gemini + Sarvam keys) and the engine badge in the header. */
+import { GEMINI, STORAGE_KEYS } from '../config.js';
 import { $, store } from '../dom.js';
-import { onSarvamChange, sarvamAvailable } from '../sarvam.js';
+import { onSarvamChange, sarvamAvailable } from '../sarvam-access.js';
 
-// Settings modal
-function updateEngineBadge() {
-  const on = !!store.get('hb_key', '');
-  $('engineBadge').textContent = (on ? 'Gemini · ' + store.get('hb_model', 'gemini-3-flash-preview') : 'Offline rules engine') + (sarvamAvailable() ? ' · Sarvam voice' : '');
-}
 const modal = $('settings');
-const openModal = () => { $('apiKey').value = store.get('hb_key', ''); $('model').value = store.get('hb_model', 'gemini-3-flash-preview'); $('sarvamKey').value = store.get('hb_sarvam_key', ''); modal.classList.remove('hidden'); modal.classList.add('flex'); $('apiKey').focus(); };
-const closeModal = () => { modal.classList.add('hidden'); modal.classList.remove('flex'); $('openSettings').focus(); };
+
+function updateEngineBadge() {
+  const engine = store.get(STORAGE_KEYS.GEMINI_KEY, '')
+    ? 'Gemini · ' + store.get(STORAGE_KEYS.GEMINI_MODEL, GEMINI.DEFAULT_MODEL)
+    : 'Offline rules engine';
+  $('engineBadge').textContent = engine + (sarvamAvailable() ? ' · Sarvam voice' : '');
+}
+
+/** Save a trimmed value, or remove the key when the field is empty. */
+function saveOrClear(/** @type {string} */ key, /** @type {string} */ value) {
+  if (value) store.set(key, value);
+  else store.del(key);
+}
+
+function openModal() {
+  $('apiKey').value = store.get(STORAGE_KEYS.GEMINI_KEY, '');
+  $('model').value = store.get(STORAGE_KEYS.GEMINI_MODEL, GEMINI.DEFAULT_MODEL);
+  $('sarvamKey').value = store.get(STORAGE_KEYS.SARVAM_KEY, '');
+  modal.classList.remove('hidden');
+  modal.classList.add('flex');
+  $('apiKey').focus();
+}
+
+function closeModal() {
+  modal.classList.add('hidden');
+  modal.classList.remove('flex');
+  $('openSettings').focus();
+}
+
 $('openSettings').addEventListener('click', openModal);
 $('closeSettings').addEventListener('click', closeModal);
 $('saveSettings').addEventListener('click', () => {
-  const k = $('apiKey').value.trim(), m = $('model').value.trim() || 'gemini-3-flash-preview';
-  k ? store.set('hb_key', k) : store.del('hb_key'); store.set('hb_model', m);
-  const s = $('sarvamKey').value.trim(); s ? store.set('hb_sarvam_key', s) : store.del('hb_sarvam_key');
-  updateEngineBadge(); closeModal();
+  saveOrClear(STORAGE_KEYS.GEMINI_KEY, $('apiKey').value.trim());
+  store.set(STORAGE_KEYS.GEMINI_MODEL, $('model').value.trim() || GEMINI.DEFAULT_MODEL);
+  saveOrClear(STORAGE_KEYS.SARVAM_KEY, $('sarvamKey').value.trim());
+  updateEngineBadge();
+  closeModal();
 });
-$('clearKey').addEventListener('click', () => { $('apiKey').value = ''; $('sarvamKey').value = ''; store.del('hb_key'); store.del('hb_sarvam_key'); updateEngineBadge(); });
-modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal(); });
+$('clearKey').addEventListener('click', () => {
+  $('apiKey').value = '';
+  $('sarvamKey').value = '';
+  store.del(STORAGE_KEYS.GEMINI_KEY);
+  store.del(STORAGE_KEYS.SARVAM_KEY);
+  updateEngineBadge();
+});
+modal.addEventListener('click', (/** @type {MouseEvent} */ e) => {
+  if (e.target === modal) closeModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal();
+});
+
 updateEngineBadge();
-onSarvamChange(() => { $('autoSpeak').disabled = false; updateEngineBadge(); });
+onSarvamChange(() => {
+  $('autoSpeak').disabled = false;
+  updateEngineBadge();
+});

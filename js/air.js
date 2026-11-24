@@ -1,14 +1,30 @@
 /** Telemetry: geolocation, Open-Meteo current + hourly data, city presets, AQI simulator. */
+import { AIR_RETRIES, PM10_PER_PM25, TIMEOUT_MS } from './config.js';
 import { CITIES } from './data/cities.js';
 import { L10N } from './data/l10n.js';
 import { $ } from './dom.js';
-import { BANDS, aqiToPm25, bandIndex, pm25ToAqi } from './lib/aqi.js';
+import { BANDS, aqiToPm25, bandIndex } from './lib/aqi.js';
+import { fetchJson } from './lib/http.js';
+import { logger } from './lib/log.js';
+import { airQualityUrl, parseAirResponse } from './lib/openmeteo.js';
 import { Mascot } from './mascot.js';
 
-const airListeners = [];
-export const onAirChange = (f) => airListeners.push(f);
+/** @typedef {import('./types.js').AirReading} AirReading */
 
+const log = logger('air');
+/** @type {Array<() => void>} */
+const airListeners = [];
+/** @param {() => void} listener called after every change to Air */
+export const onAirChange = (listener) => airListeners.push(listener);
+
+/** @type {AirReading} */
 export const Air = { aqi: 80, pm2_5: aqiToPm25(80), pm10: null, source: 'simulated', place: '' };
+
+const SOURCE_LABEL = {
+  live: () => `Live · ${Air.place} · Open-Meteo`,
+  sample: () => `Sample data · ${Air.place} (live fetch failed)`,
+  simulated: () => 'Simulated with the slider · PM2.5 derived from AQI',
+};
 
 export function renderAir() {
   const b = bandIndex(Air.aqi);
@@ -20,57 +36,72 @@ export function renderAir() {
   $('pm10').textContent = Air.pm10 != null ? Math.round(Air.pm10) : '—';
   $('sim').value = Math.round(Air.aqi);
   $('simVal').textContent = Math.round(Air.aqi);
-  $('aqiSource').textContent = {
-    live: `Live · ${Air.place} · Open-Meteo`,
-    sample: `Sample data · ${Air.place} (live fetch failed)`,
-    simulated: 'Simulated with the slider · PM2.5 derived from AQI',
-  }[Air.source];
+  $('aqiSource').textContent = SOURCE_LABEL[Air.source]();
   Mascot.setAQI(Air.aqi);
   airListeners.forEach((f) => f());
 }
 
+/** @param {number} lat @param {number} lon */
 async function fetchAir(lat, lon) {
-  const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat.toFixed(4)}&longitude=${lon.toFixed(4)}&current=us_aqi,pm2_5,pm10&hourly=us_aqi,pm2_5&forecast_days=2&timezone=auto`;
-  const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 9000);
-  try {
-    const r = await fetch(url, { signal: ctrl.signal });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const d = await r.json(), c = d.current || {};
-    if (typeof c.us_aqi !== 'number') throw new Error('No AQI in response');
-    let hourly = null;
-    if (d.hourly?.time) {
-      const nowH = (c.time || '').slice(0, 13);
-      let s = d.hourly.time.findIndex((t) => t.slice(0, 13) >= nowH); if (s < 0) s = 0;
-      hourly = d.hourly.time.slice(s, s + 24).map((t, i) => { const pm = d.hourly.pm2_5?.[s + i]; return { t, pm, aqi: typeof pm === 'number' ? pm25ToAqi(pm) : d.hourly.us_aqi[s + i] }; }).filter((x) => typeof x.aqi === 'number');
-    }
-    return { aqi: c.us_aqi, pm2_5: c.pm2_5 ?? aqiToPm25(c.us_aqi), pm10: c.pm10 ?? null, hourly };
-  } finally { clearTimeout(to); }
+  const data = await fetchJson(airQualityUrl(lat, lon), { timeoutMs: TIMEOUT_MS.AIR, retries: AIR_RETRIES });
+  return parseAirResponse(data);
 }
 
+/** @param {(typeof CITIES)[number]} city */
 export async function loadCity(city) {
   $('aqiSource').textContent = `Fetching ${city.name}…`;
-  try { Object.assign(Air, await fetchAir(city.lat, city.lon), { source: 'live', place: city.name }); }
-  catch { Object.assign(Air, city.sample, { source: 'sample', place: city.name, hourly: null }); }
+  try {
+    Object.assign(Air, await fetchAir(city.lat, city.lon), { source: 'live', place: city.name });
+  } catch (e) {
+    log.warn(`Open-Meteo failed for ${city.name}; showing sample data`, e);
+    Object.assign(Air, city.sample, { source: 'sample', place: city.name, hourly: null });
+  }
   renderAir();
 }
 
 export function useMyLocation() {
-  if (!navigator.geolocation) { $('aqiSource').textContent = 'Geolocation is not available in this browser.'; return; }
+  if (!navigator.geolocation) {
+    $('aqiSource').textContent = 'Geolocation is not available in this browser.';
+    return;
+  }
   $('aqiSource').textContent = 'Locating…';
-  navigator.geolocation.getCurrentPosition(async (p) => {
-    const { latitude: lat, longitude: lon } = p.coords;
-    try { Object.assign(Air, await fetchAir(lat, lon), { source: 'live', place: `${lat.toFixed(2)}, ${lon.toFixed(2)}` }); $('city').value = ''; renderAir(); }
-    catch (e) { $('aqiSource').textContent = 'Could not reach Open-Meteo: ' + e.message; }
-  }, (err) => { $('aqiSource').textContent = 'Location unavailable (' + err.message + '). Pick a city instead.'; },
-  { enableHighAccuracy: false, timeout: 10000, maximumAge: 600000 });
+  navigator.geolocation.getCurrentPosition(
+    async (p) => {
+      const { latitude: lat, longitude: lon } = p.coords;
+      try {
+        Object.assign(Air, await fetchAir(lat, lon), { source: 'live', place: `${lat.toFixed(2)}, ${lon.toFixed(2)}` });
+        $('city').value = '';
+        renderAir();
+      } catch (e) {
+        log.warn('Open-Meteo failed for current location', e);
+        $('aqiSource').textContent = 'Could not reach Open-Meteo: ' + /** @type {Error} */ (e).message;
+      }
+    },
+    (err) => {
+      $('aqiSource').textContent = 'Location unavailable (' + err.message + '). Pick a city instead.';
+    },
+    { enableHighAccuracy: false, timeout: 10_000, maximumAge: 600_000 },
+  );
 }
 
-CITIES.forEach((c, i) => $('city').add(new Option(c.name, i)));
-$('city').addEventListener('change', (e) => { if (e.target.value !== '') loadCity(CITIES[+e.target.value]); });
-$('locBtn').addEventListener('click', useMyLocation);
-$('sim').addEventListener('input', (e) => {
-  const v = +e.target.value;
-  Object.assign(Air, { aqi: v, pm2_5: aqiToPm25(v), pm10: Math.round(aqiToPm25(v) * 1.7), source: 'simulated', place: '', hourly: null });
+/** Simulator: derive PM2.5 from the chosen AQI and estimate PM10 from it. */
+function simulate(/** @type {number} */ aqi) {
+  const pm25 = aqiToPm25(aqi);
+  Object.assign(Air, {
+    aqi,
+    pm2_5: pm25,
+    pm10: Math.round(pm25 * PM10_PER_PM25),
+    source: 'simulated',
+    place: '',
+    hourly: null,
+  });
   $('city').value = '';
   renderAir();
+}
+
+CITIES.forEach((c, i) => $('city').add(new Option(c.name, String(i))));
+$('city').addEventListener('change', (/** @type {any} */ e) => {
+  if (e.target.value !== '') loadCity(CITIES[+e.target.value]);
 });
+$('locBtn').addEventListener('click', useMyLocation);
+$('sim').addEventListener('input', (/** @type {any} */ e) => simulate(+e.target.value));

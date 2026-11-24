@@ -1,165 +1,291 @@
-/** Speech in (Sarvam or Web Speech API) and out (Sarvam or speechSynthesis). */
+/** Speech in (Sarvam or Web Speech API) and out (Sarvam or speechSynthesis): recording, playback and state. */
+import { RECORDING_MIME_TYPES, SARVAM, STORAGE_KEYS } from './config.js';
 import { $, micUI, note, store } from './dom.js';
+import { logger } from './lib/log.js';
+import { synthesize, transcribe } from './lib/sarvam-client.js';
 import { Mascot } from './mascot.js';
-import { getSarvamKey, sarvamAvailable } from './sarvam.js';
+import { getSarvamKey, sarvamAvailable } from './sarvam-access.js';
+
+/** @typedef {(text: string) => void} InterimHandler */
+/** @typedef {(text: string, language?: string | null) => void} FinalHandler */
+
+const log = logger('speech');
 
 export const Speech = (() => {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let rec = null, mediaRec = null, capTimer = null, listening = false, finalText = '', rate = +store.get('hb_rate', '1');
-  let voices = [];
-  const loadVoices = () => { voices = window.speechSynthesis ? speechSynthesis.getVoices() : []; };
-  if (window.speechSynthesis) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  /** @type {any} */
+  let recognition = null;
+  /** @type {MediaRecorder | null} */
+  let recorder = null;
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let recordingCap;
+  let listening = false;
+  let finalText = '';
+  let rate = +store.get(STORAGE_KEYS.RATE, '1');
 
+  /** @type {SpeechSynthesisVoice[]} */
+  let voices = [];
+  const loadVoices = () => {
+    voices = window.speechSynthesis ? speechSynthesis.getVoices() : [];
+  };
+  if (window.speechSynthesis) {
+    loadVoices();
+    speechSynthesis.onvoiceschanged = loadVoices;
+  }
+
+  /** @param {string} lang BCP-47 */
   function pickVoice(lang) {
-    const norm = (s) => s.replace('_', '-').toLowerCase();
-    const want = norm(lang), base = want.split('-')[0];
+    const norm = (/** @type {string} */ s) => s.replace('_', '-').toLowerCase();
+    const want = norm(lang);
+    const base = want.split('-')[0];
     return voices.find((v) => norm(v.lang) === want) || voices.find((v) => norm(v.lang).startsWith(base + '-')) || null;
   }
 
-  // Sarvam path: record a clip, then transcribe it with saaras:v4 (REST endpoint is for clips under 30 s).
-  async function startSarvam(key, onInterim, onFinal) {
+  // ---------- Speech in ----------
+
+  /** Sarvam path: record a clip (tap again to stop, auto-stop at the cap), then transcribe it. */
+  async function startSarvam(
+    /** @type {string} */ key,
+    /** @type {InterimHandler} */ onInterim,
+    /** @type {FinalHandler} */ onFinal,
+  ) {
+    /** @type {MediaStream} */
     let stream;
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
-    catch { note('Microphone permission was denied.'); return false; }
-    const mime = ['audio/webm', 'audio/mp4', 'audio/ogg'].find((t) => MediaRecorder.isTypeSupported(t));
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      log.debug('getUserMedia rejected', e);
+      note('Microphone permission was denied.');
+      return false;
+    }
+    const mime = RECORDING_MIME_TYPES.find((t) => MediaRecorder.isTypeSupported(t));
+    /** @type {Blob[]} */
     const chunks = [];
-    mediaRec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-    mediaRec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-    mediaRec.onstop = async () => {
-      stream.getTracks().forEach((t) => t.stop());
-      clearTimeout(capTimer); mediaRec = null; listening = false; micUI(false);
-      const blob = new Blob(chunks, { type: (chunks[0]?.type || mime || 'audio/webm').split(';')[0] });
-      if (blob.size < 2000) { note('I didn\'t hear anything. Try again.'); Mascot.setMascotState('IDLE'); return; }
-      Mascot.setMascotState('THINKING'); onInterim('Transcribing…');
-      try {
-        const { text, language } = await sarvamTranscribe(blob, key);
-        onInterim(text);
-        if (text) onFinal(text, language); else { note('Sarvam returned no speech. Try again.'); Mascot.setMascotState('IDLE'); }
-      } catch (e) { onInterim(''); note('Sarvam: ' + e.message); Mascot.setMascotState('IDLE'); }
+    recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    recorder.ondataavailable = (e) => {
+      if (e.data.size) chunks.push(e.data);
     };
-    mediaRec.start();
-    listening = true; Mascot.setMascotState('LISTENING'); micUI(true);
-    capTimer = setTimeout(() => { if (mediaRec?.state === 'recording') mediaRec.stop(); }, 25000);
+    recorder.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      clearTimeout(recordingCap);
+      recorder = null;
+      listening = false;
+      micUI(false);
+      const clip = new Blob(chunks, { type: (chunks[0]?.type || mime || 'audio/webm').split(';')[0] });
+      if (clip.size < SARVAM.MIN_CLIP_BYTES) {
+        note("I didn't hear anything. Try again.");
+        Mascot.setMascotState('IDLE');
+        return;
+      }
+      Mascot.setMascotState('THINKING');
+      onInterim('Transcribing…');
+      try {
+        const { text, language } = await transcribe(clip, key || undefined);
+        onInterim(text);
+        if (text) onFinal(text, language);
+        else {
+          note('Sarvam returned no speech. Try again.');
+          Mascot.setMascotState('IDLE');
+        }
+      } catch (e) {
+        log.warn('Sarvam transcription failed', e);
+        onInterim('');
+        note('Sarvam: ' + /** @type {Error} */ (e).message);
+        Mascot.setMascotState('IDLE');
+      }
+    };
+    recorder.start();
+    listening = true;
+    Mascot.setMascotState('LISTENING');
+    micUI(true);
+    recordingCap = setTimeout(() => {
+      if (recorder?.state === 'recording') recorder.stop();
+    }, SARVAM.MAX_RECORDING_MS);
     return true;
   }
 
-  // With a personal key, call Sarvam directly; otherwise go through this site's /api/sarvam proxy.
-  async function sarvamTranscribe(blob, key) {
-    const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 20000);
-    let url = '/api/sarvam?op=stt', init = { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob, signal: ctrl.signal };
-    if (key) {
-      const ext = { 'audio/webm': 'webm', 'audio/mp4': 'm4a', 'audio/ogg': 'ogg' }[blob.type] || 'webm';
-      const fd = new FormData();
-      fd.append('file', blob, 'speech.' + ext);
-      fd.append('model', 'saaras:v4');
-      fd.append('language_code', 'unknown'); // let Sarvam detect the spoken language
-      url = 'https://api.sarvam.ai/speech-to-text'; init = { method: 'POST', headers: { 'api-subscription-key': key }, body: fd, signal: ctrl.signal };
-    }
-    try {
-      const r = await fetch(url, init);
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j.error?.message || 'HTTP ' + r.status);
-      return { text: (j.transcript || '').trim(), language: j.language_code || null };
-    } catch (e) { throw e.name === 'AbortError' ? new Error('timed out') : e; }
-    finally { clearTimeout(to); }
-  }
-
-  function start(lang, onInterim, onFinal) {
-    if (sarvamAvailable() && window.MediaRecorder && navigator.mediaDevices) { stopSpeaking(); return startSarvam(getSarvamKey(), onInterim, onFinal); }
-    if (!SR) { note('Speech recognition is not supported in this browser. Try Chrome or Edge, or type your question.'); return false; }
-    stopSpeaking();
-    rec = new SR();
-    rec.lang = lang; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
+  /** Browser path: Web Speech API with live interim transcripts. */
+  function startBrowser(
+    /** @type {string} */ lang,
+    /** @type {InterimHandler} */ onInterim,
+    /** @type {FinalHandler} */ onFinal,
+  ) {
+    recognition = new SpeechRecognition();
+    recognition.lang = lang;
+    recognition.interimResults = true;
+    recognition.continuous = false;
+    recognition.maxAlternatives = 1;
     finalText = '';
-    rec.onstart = () => { listening = true; Mascot.setMascotState('LISTENING'); micUI(true); };
-    rec.onresult = (e) => {
+    recognition.onstart = () => {
+      listening = true;
+      Mascot.setMascotState('LISTENING');
+      micUI(true);
+    };
+    recognition.onresult = (/** @type {any} */ e) => {
       let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i];
-        if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript;
+        if (r.isFinal) finalText += r[0].transcript;
+        else interim += r[0].transcript;
       }
       onInterim((finalText + interim).trim());
     };
-    rec.onerror = (e) => {
+    recognition.onerror = (/** @type {any} */ e) => {
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') note('Microphone permission was denied.');
-      else if (e.error === 'no-speech') note('I didn\'t hear anything. Try again.');
-      else if (e.error !== 'aborted') note('Speech error: ' + e.error);
+      else if (e.error === 'no-speech') note("I didn't hear anything. Try again.");
+      else if (e.error !== 'aborted') {
+        log.warn('speech recognition error', e.error);
+        note('Speech error: ' + e.error);
+      }
     };
-    rec.onend = () => {
-      listening = false; micUI(false);
+    recognition.onend = () => {
+      listening = false;
+      micUI(false);
       const text = finalText.trim() || $('query').value.trim();
-      if (text) { Mascot.setMascotState('THINKING'); onFinal(text); } else Mascot.setMascotState('IDLE');
+      if (text) {
+        Mascot.setMascotState('THINKING');
+        onFinal(text);
+      } else Mascot.setMascotState('IDLE');
     };
-    try { rec.start(); } catch { return false; }
+    try {
+      recognition.start();
+    } catch (e) {
+      log.warn('speech recognition could not start', e);
+      return false;
+    }
     return true;
   }
-  function stopListening() { if (mediaRec?.state === 'recording') mediaRec.stop(); else if (rec && listening) rec.stop(); }
 
-  // Voice output: Sarvam (bulbul:v3) when a key is available, browser voices otherwise or if Sarvam fails.
-  let audio = null, ttsSeq = 0;
-  function speakText(text, lang, r = rate) {
+  /**
+   * @param {string} lang language picker value (used by the browser recogniser; Sarvam auto-detects)
+   * @param {InterimHandler} onInterim
+   * @param {FinalHandler} onFinal
+   */
+  function start(lang, onInterim, onFinal) {
+    if (sarvamAvailable() && window.MediaRecorder && navigator.mediaDevices) {
+      stopSpeaking();
+      return startSarvam(getSarvamKey(), onInterim, onFinal);
+    }
+    if (!SpeechRecognition) {
+      note('Speech recognition is not supported in this browser. Try Chrome or Edge, or type your question.');
+      return false;
+    }
     stopSpeaking();
-    if (sarvamAvailable()) sarvamSpeak(text, lang, r, getSarvamKey()); else browserSpeak(text, lang, r);
+    return startBrowser(lang, onInterim, onFinal);
   }
 
-  async function sarvamSpeak(text, lang, r, key) {
-    const seq = ++ttsSeq;
+  function stopListening() {
+    if (recorder?.state === 'recording') recorder.stop();
+    else if (recognition && listening) recognition.stop();
+  }
+
+  // ---------- Speech out ----------
+
+  /** @type {HTMLAudioElement | null} */
+  let audio = null;
+  /** Incremented on every new utterance or stop, so stale async playback can tell it was cancelled. */
+  let utteranceId = 0;
+
+  /** @param {string} text @param {string} lang @param {number} [pace] */
+  function speakText(text, lang, pace = rate) {
+    stopSpeaking();
+    if (sarvamAvailable()) sarvamSpeak(text, lang, pace, getSarvamKey());
+    else browserSpeak(text, lang, pace);
+  }
+
+  /** Sarvam voice; falls back to the browser voice if Sarvam or playback fails. */
+  async function sarvamSpeak(
+    /** @type {string} */ text,
+    /** @type {string} */ lang,
+    /** @type {number} */ pace,
+    /** @type {string} */ key,
+  ) {
+    const id = ++utteranceId;
     try {
-      const res = key
-        ? await fetch('https://api.sarvam.ai/text-to-speech', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'api-subscription-key': key },
-          body: JSON.stringify({ text: text.slice(0, 2500), language_code: lang, model: 'bulbul:v3', pace: r }),
-        })
-        : await fetch('/api/sarvam?op=tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text, language_code: lang, pace: r }),
-        });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j.error?.message || 'HTTP ' + res.status);
-      const clips = j.audios || [];
-      if (!clips.length) throw new Error('no audio returned');
-      if (seq !== ttsSeq) return; // stopped or replaced while waiting
+      const clips = await synthesize(text, lang, pace, key || undefined);
+      if (id !== utteranceId) return; // stopped or replaced while waiting
+      /** @param {number} i @returns {Promise<void> | void} */
       const play = (i) => {
-        if (seq !== ttsSeq) return;
-        if (i >= clips.length) { audio = null; Mascot.setMascotState('IDLE'); return; }
+        if (id !== utteranceId) return;
+        if (i >= clips.length) {
+          audio = null;
+          Mascot.setMascotState('IDLE');
+          return;
+        }
         audio = new Audio('data:audio/wav;base64,' + clips[i]);
         audio.onended = () => play(i + 1);
-        audio.onerror = () => { audio = null; Mascot.setMascotState('IDLE'); };
+        audio.onerror = () => {
+          log.warn('audio playback error');
+          audio = null;
+          Mascot.setMascotState('IDLE');
+        };
         return audio.play();
       };
       Mascot.setMascotState('SPEAKING');
       await play(0);
     } catch (e) {
-      if (seq !== ttsSeq) return;
-      note('Sarvam voice: ' + e.message + '. Using the browser voice.');
-      browserSpeak(text, lang, r);
+      if (id !== utteranceId) return;
+      log.warn('Sarvam voice failed; using the browser voice', e);
+      note('Sarvam voice: ' + /** @type {Error} */ (e).message + '. Using the browser voice.');
+      browserSpeak(text, lang, pace);
     }
   }
 
-  // Chrome cuts long utterances; speak sentence by sentence.
-  function browserSpeak(text, lang, r) {
-    if (!window.speechSynthesis) { Mascot.setMascotState('IDLE'); return; }
+  /** Browser voice. Chrome cuts long utterances, so speak sentence by sentence. */
+  function browserSpeak(/** @type {string} */ text, /** @type {string} */ lang, /** @type {number} */ pace) {
+    if (!window.speechSynthesis) {
+      Mascot.setMascotState('IDLE');
+      return;
+    }
     speechSynthesis.cancel();
-    const parts = text.match(/[^.!?।\n]+[.!?।]?/g)?.map((s) => s.trim()).filter(Boolean) || [text];
+    const sentences = text
+      .match(/[^.!?।\n]+[.!?।]?/g)
+      ?.map((s) => s.trim())
+      .filter(Boolean) || [text];
     const voice = pickVoice(lang);
     if (!voice && voices.length) note(`No ${lang} voice installed; your browser may read this with a default voice.`);
-    parts.forEach((p, i) => {
-      const u = new SpeechSynthesisUtterance(p);
-      u.lang = lang; u.rate = r; if (voice) u.voice = voice;
+    sentences.forEach((sentence, i) => {
+      const u = new SpeechSynthesisUtterance(sentence);
+      u.lang = lang;
+      u.rate = pace;
+      if (voice) u.voice = voice;
       if (i === 0) u.onstart = () => Mascot.setMascotState('SPEAKING');
-      if (i === parts.length - 1) { u.onend = () => Mascot.setMascotState('IDLE'); u.onerror = () => Mascot.setMascotState('IDLE'); }
+      if (i === sentences.length - 1) {
+        u.onend = () => Mascot.setMascotState('IDLE');
+        u.onerror = () => Mascot.setMascotState('IDLE');
+      }
       speechSynthesis.speak(u);
     });
   }
+
   function stopSpeaking() {
-    ttsSeq++;
-    if (audio) { audio.pause(); audio = null; }
+    utteranceId++;
+    if (audio) {
+      audio.pause();
+      audio = null;
+    }
     if (window.speechSynthesis) speechSynthesis.cancel();
     if (Mascot.state === 'SPEAKING') Mascot.setMascotState('IDLE');
   }
-  function setRate(r) { rate = r; store.set('hb_rate', String(r)); }
 
-  return { start, stopListening, speakText, stopSpeaking, setRate, get rate() { return rate; }, get listening() { return listening; }, supported: !!SR };
+  /** @param {number} r */
+  function setRate(r) {
+    rate = r;
+    store.set(STORAGE_KEYS.RATE, String(r));
+  }
+
+  return {
+    start,
+    stopListening,
+    speakText,
+    stopSpeaking,
+    setRate,
+    get rate() {
+      return rate;
+    },
+    get listening() {
+      return listening;
+    },
+    supported: Boolean(SpeechRecognition),
+  };
 })();
