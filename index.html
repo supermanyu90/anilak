@@ -350,12 +350,12 @@
 <div id="settings" class="fixed inset-0 z-50 hidden items-center justify-center bg-ink/30 p-4" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
   <div class="glass w-full max-w-md rounded-3xl bg-white p-6 shadow-lift">
     <h3 id="settingsTitle" class="font-display text-2xl font-semibold text-ink">Developer settings</h3>
-    <p class="mt-1 text-xs text-ink2">Add a Gemini API key to answer with Gemini. Without one, Vayu uses the built-in offline rules engine. Add a Sarvam API key to transcribe voice with Sarvam instead of the browser. Keys stay in this browser's local storage and are only sent to generativelanguage.googleapis.com and api.sarvam.ai.</p>
+    <p class="mt-1 text-xs text-ink2">Add a Gemini API key to answer with Gemini. Without one, Vayu uses the built-in offline rules engine. Add a Sarvam API key (or set SARVAM_API_KEY in a local .env) to use Sarvam for voice input and spoken replies instead of the browser. Keys stay in this browser's local storage and are only sent to generativelanguage.googleapis.com and api.sarvam.ai.</p>
     <label class="mt-4 block text-xs text-ink2" for="apiKey">Gemini API key</label>
     <input id="apiKey" type="password" autocomplete="off" class="mt-1 w-full rounded-lg border border-ink/10 bg-cream px-3 py-2 text-sm text-ink outline-none focus:border-sage-ink" placeholder="AIza…" />
     <label class="mt-3 block text-xs text-ink2" for="model">Model</label>
     <input id="model" class="mt-1 w-full rounded-lg border border-ink/10 bg-cream px-3 py-2 text-sm text-ink outline-none focus:border-sage-ink" />
-    <label class="mt-3 block text-xs text-ink2" for="sarvamKey">Sarvam API key (voice input)</label>
+    <label class="mt-3 block text-xs text-ink2" for="sarvamKey">Sarvam API key (voice in &amp; out)</label>
     <input id="sarvamKey" type="password" autocomplete="off" class="mt-1 w-full rounded-lg border border-ink/10 bg-cream px-3 py-2 text-sm text-ink outline-none focus:border-sage-ink" />
     <div class="mt-5 flex justify-end gap-2">
       <button id="clearKey" class="rounded-lg px-3 py-2 text-sm text-ink2 hover:bg-blush-50">Clear keys</button>
@@ -892,7 +892,7 @@ const Speech = (() => {
   }
 
   function start(lang, onInterim, onFinal) {
-    const sarvamKey = store.get('hb_sarvam_key', '');
+    const sarvamKey = getSarvamKey();
     if (sarvamKey && window.MediaRecorder && navigator.mediaDevices) { stopSpeaking(); return startSarvam(sarvamKey, onInterim, onFinal); }
     if (!SR) { note('Speech recognition is not supported in this browser. Try Chrome or Edge, or type your question.'); return false; }
     stopSpeaking();
@@ -923,9 +923,47 @@ const Speech = (() => {
   }
   function stopListening() { if (mediaRec?.state === 'recording') mediaRec.stop(); else if (rec && listening) rec.stop(); }
 
-  // Chrome cuts long utterances; speak sentence by sentence.
+  // Voice output: Sarvam (bulbul:v3) when a key is available, browser voices otherwise or if Sarvam fails.
+  let audio = null, ttsSeq = 0;
   function speakText(text, lang, r = rate) {
-    if (!window.speechSynthesis) return;
+    stopSpeaking();
+    const key = getSarvamKey();
+    if (key) sarvamSpeak(text, lang, r, key); else browserSpeak(text, lang, r);
+  }
+
+  async function sarvamSpeak(text, lang, r, key) {
+    const seq = ++ttsSeq;
+    try {
+      const res = await fetch('https://api.sarvam.ai/text-to-speech', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'api-subscription-key': key },
+        body: JSON.stringify({ text: text.slice(0, 2500), language_code: lang, model: 'bulbul:v3', pace: r }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j.error?.message || 'HTTP ' + res.status);
+      const clips = j.audios || [];
+      if (!clips.length) throw new Error('no audio returned');
+      if (seq !== ttsSeq) return; // stopped or replaced while waiting
+      const play = (i) => {
+        if (seq !== ttsSeq) return;
+        if (i >= clips.length) { audio = null; Mascot.setMascotState('IDLE'); return; }
+        audio = new Audio('data:audio/wav;base64,' + clips[i]);
+        audio.onended = () => play(i + 1);
+        audio.onerror = () => { audio = null; Mascot.setMascotState('IDLE'); };
+        return audio.play();
+      };
+      Mascot.setMascotState('SPEAKING');
+      await play(0);
+    } catch (e) {
+      if (seq !== ttsSeq) return;
+      note('Sarvam voice: ' + e.message + '. Using the browser voice.');
+      browserSpeak(text, lang, r);
+    }
+  }
+
+  // Chrome cuts long utterances; speak sentence by sentence.
+  function browserSpeak(text, lang, r) {
+    if (!window.speechSynthesis) { Mascot.setMascotState('IDLE'); return; }
     speechSynthesis.cancel();
     const parts = text.match(/[^.!?।\n]+[.!?।]?/g)?.map((s) => s.trim()).filter(Boolean) || [text];
     const voice = pickVoice(lang);
@@ -938,7 +976,12 @@ const Speech = (() => {
       speechSynthesis.speak(u);
     });
   }
-  function stopSpeaking() { if (window.speechSynthesis) speechSynthesis.cancel(); if (Mascot.state === 'SPEAKING') Mascot.setMascotState('IDLE'); }
+  function stopSpeaking() {
+    ttsSeq++;
+    if (audio) { audio.pause(); audio = null; }
+    if (window.speechSynthesis) speechSynthesis.cancel();
+    if (Mascot.state === 'SPEAKING') Mascot.setMascotState('IDLE');
+  }
   function setRate(r) { rate = r; store.set('hb_rate', String(r)); }
 
   return { start, stopListening, speakText, stopSpeaking, setRate, get rate() { return rate; }, get listening() { return listening; }, supported: !!SR };
@@ -1166,7 +1209,7 @@ function render(res, langTag, emergency, fallbackReason = '') {
 
   lastSpoken = { text: res.spoken, lang: langTag };
   $('replayBtn').disabled = false;
-  if ($('autoSpeak').checked && window.speechSynthesis) Speech.speakText(res.spoken, langTag);
+  if ($('autoSpeak').checked) Speech.speakText(res.spoken, langTag);
   else Mascot.setMascotState('IDLE');
 }
 
@@ -1230,13 +1273,23 @@ function renderRates() {
 document.querySelectorAll('#rates button').forEach((b) => b.addEventListener('click', () => { Speech.setRate(+b.dataset.rate); renderRates(); }));
 renderRates();
 
-if (!Speech.supported && !store.get('hb_sarvam_key', '')) note('Voice input needs Chrome or Edge. You can still type questions.');
-if (!window.speechSynthesis) $('autoSpeak').disabled = true;
+
+// Sarvam key: settings value first, else SARVAM_API_KEY from the git-ignored .env (only read on localhost).
+let envSarvamKey = '';
+const getSarvamKey = () => store.get('hb_sarvam_key', '') || envSarvamKey;
+if (/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)) {
+  fetch('.env', { cache: 'no-store' }).then((r) => (r.ok ? r.text() : '')).then((t) => {
+    const m = t.match(/^\s*SARVAM_API_KEY\s*=\s*["']?([^"'\s#]+)/m);
+    if (m) { envSarvamKey = m[1]; updateEngineBadge(); }
+  }).catch(() => {});
+}
+if (!Speech.supported && !getSarvamKey()) note('Voice input needs Chrome or Edge. You can still type questions.');
+if (!window.speechSynthesis && !getSarvamKey()) $('autoSpeak').disabled = true;
 
 // Settings modal
 function updateEngineBadge() {
   const on = !!store.get('hb_key', '');
-  $('engineBadge').textContent = (on ? 'Gemini · ' + store.get('hb_model', 'gemini-3-flash-preview') : 'Offline rules engine') + (store.get('hb_sarvam_key', '') ? ' · Sarvam voice' : '');
+  $('engineBadge').textContent = (on ? 'Gemini · ' + store.get('hb_model', 'gemini-3-flash-preview') : 'Offline rules engine') + (getSarvamKey() ? ' · Sarvam voice' : '');
 }
 const modal = $('settings');
 const openModal = () => { $('apiKey').value = store.get('hb_key', ''); $('model').value = store.get('hb_model', 'gemini-3-flash-preview'); $('sarvamKey').value = store.get('hb_sarvam_key', ''); modal.classList.remove('hidden'); modal.classList.add('flex'); $('apiKey').focus(); };
